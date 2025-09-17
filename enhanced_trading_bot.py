@@ -31,7 +31,7 @@ class DigitDiffersBot:
         self.trade_cycle_count = 0
         
         # Trading parameters
-        self.stake = max(0.35, 1.0)  # Ensure minimum stake requirement
+        self.stake = max(1, 1.0)  # Ensure minimum stake requirement
         self.duration = 1  # 5 ticks duration
         self.min_analysis_ticks = 5  # Need at least 5 ticks for new strategy
         
@@ -258,7 +258,11 @@ class DigitDiffersBot:
             await self._log(f"Daily loss limit reached (${self.daily_loss_limit}). Stopping trades.", "warning")
             return
 
-        # Calculate target digit from last 5 digits average (FIXED: removed await)
+        # Only trade if we're in a cycle (not waiting for a win to start over)
+        if self.current_target_digit is not None:
+            return
+
+        # Calculate target digit from last 5 digits average
         target_digit = self._calculate_target_digit()
         if target_digit is None:
             return
@@ -277,7 +281,7 @@ class DigitDiffersBot:
             adjusted_stake = self.stake
         
         # Ensure minimum stake requirement (Deriv minimum is $0.35)
-        MINIMUM_STAKE = 0.35
+        MINIMUM_STAKE = 1
         if adjusted_stake < MINIMUM_STAKE:
             await self._log(f"Stake ${adjusted_stake:.2f} is below minimum ${MINIMUM_STAKE}. Using minimum stake.", "warning")
             adjusted_stake = MINIMUM_STAKE
@@ -288,7 +292,7 @@ class DigitDiffersBot:
             contract_params = {
                 "contract_type": "DIGITDIFF",
                 "symbol": self.active_symbol,
-                "barrier": str(target_digit),  # FIXED: Convert to string
+                "barrier": str(target_digit),
                 "amount": round(adjusted_stake, 2),
                 "basis": "stake",
                 "duration": self.duration,
@@ -436,9 +440,8 @@ class DigitDiffersBot:
                             await self._log(f"Trade WON: Contract {contract_id}. Profit: +${profit_loss:.2f}", "success")
                             await self._log(f"Cycle #{self.trade_cycle_count} completed successfully! Starting new cycle...", "info")
                             
-                            # Reset for new cycle after win
-                            self.last_5_digits.clear()
-                            self.current_target_digit = None
+                            # Reset for new cycle after win - this is the key change
+                            self.current_target_digit = None  # Allow new trades
                             
                         else:
                             loss = abs(profit_loss)
@@ -560,7 +563,7 @@ class DigitDiffersBot:
     async def update_settings(self, **kwargs):
         """Update bot settings dynamically"""
         if "stake" in kwargs:
-            new_stake = max(0.35, float(kwargs["stake"]))  # Ensure minimum stake
+            new_stake = max(1, float(kwargs["stake"]))  # Ensure minimum stake
             self.stake = new_stake
         if "trade_cooldown" in kwargs:
             self.trade_cooldown = max(1, int(kwargs["trade_cooldown"]))
