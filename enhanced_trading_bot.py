@@ -32,7 +32,7 @@ class DigitDiffersBot:
         
         # Trading parameters
         self.stake = max(0.35, 1.0)  # Ensure minimum stake requirement
-        self.duration = 5  # 5 ticks duration
+        self.duration = 1  # 5 ticks duration
         self.min_analysis_ticks = 5  # Need at least 5 ticks for new strategy
         
         # Performance tracking
@@ -132,7 +132,7 @@ class DigitDiffersBot:
             return False
 
     async def start(self, symbol: str, token: str, stake: float = 1.0, 
-                   duration: int = 5, callback: Optional[callable] = None):
+                   duration: int = 1, callback: Optional[callable] = None):
         """Start the Digit Differs trading bot with new averaging strategy"""
         try:
             self.auth_token = token
