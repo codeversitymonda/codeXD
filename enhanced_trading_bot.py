@@ -9,19 +9,21 @@ import json
 class DigitDiffersBot:
     def __init__(self):
         self.is_running = False
+        self.is_connected = False
         self.active_symbol = None
         self.strategy = "digit_differs"
         self.callback_function = None
+        self.auth_token = None
         
         # Enhanced tick history tracking
-        self.tick_history = deque(maxlen=100)  # Keep last 100 ticks
+        self.tick_history = deque(maxlen=100)
         self.digit_frequencies = Counter()
         self.last_trade_time = 0
         self.trade_cooldown = 5  # seconds between trades
         
         # Trading parameters
-        self.stake = 1.0
-        self.duration = 1  # 1 tick
+        self.stake = max(0.35, 1.0)  # Ensure minimum stake requirement
+        self.duration = 5  # 5 ticks duration
         self.min_analysis_ticks = 20  # Minimum ticks before trading
         
         # Performance tracking
@@ -35,16 +37,84 @@ class DigitDiffersBot:
         self.daily_loss_limit = 50.0  # Stop if daily loss exceeds this
         self.daily_pnl = 0.0
         self.trade_start_time = time.time()
+        
+        # Connection management
+        self.connection_attempts = 0
+        self.max_connection_attempts = 3
+        self.reconnect_delay = 5  # seconds
+
+    async def ensure_connection(self) -> bool:
+        """Ensure we have a valid connection to Deriv API"""
+        if deriv_api.connected:
+            try:
+                # Test connection with a simple ping - use shorter timeout
+                ping_response = await deriv_api.ping()
+                if "error" not in ping_response:
+                    self.is_connected = True
+                    return True
+                else:
+                    await self._log(f"Connection test failed: {ping_response.get('error', {}).get('message', 'Unknown error')}", "warning")
+                    self.is_connected = False
+            except Exception as e:
+                await self._log(f"Connection test error: {str(e)}", "warning")
+                self.is_connected = False
+        
+        # If not connected, attempt to reconnect
+        if not self.is_connected and self.auth_token:
+            return await self._reconnect()
+        
+        return False
+
+    async def _reconnect(self) -> bool:
+        """Attempt to reconnect to Deriv API"""
+        if self.connection_attempts >= self.max_connection_attempts:
+            await self._log("Max reconnection attempts reached", "error")
+            return False
+            
+        self.connection_attempts += 1
+        await self._log(f"Attempting to reconnect... (Attempt {self.connection_attempts}/{self.max_connection_attempts})", "info")
+        
+        try:
+            # Properly disconnect first
+            await deriv_api.disconnect()
+            
+            # Wait before reconnecting
+            await asyncio.sleep(self.reconnect_delay)
+            
+            # Attempt connection
+            auth_result = await deriv_api.connect(self.auth_token)
+            if "error" in auth_result:
+                await self._log(f"Reconnection failed: {auth_result['error']['message']}", "error")
+                return False
+            
+            self.is_connected = True
+            self.connection_attempts = 0
+            await self._log("Successfully reconnected to Deriv API", "success")
+            
+            # Resubscribe to ticks if we were running
+            if self.is_running and self.active_symbol:
+                await deriv_api.subscribe_ticks(self.active_symbol, self._handle_tick)
+                await self._log(f"Resubscribed to {self.active_symbol} ticks", "info")
+            
+            return True
+            
+        except Exception as e:
+            await self._log(f"Reconnection error: {str(e)}", "error")
+            return False
 
     async def start(self, symbol: str, token: str, stake: float = 1.0, 
-                   duration: int = 1, callback: Optional[callable] = None):
+                   duration: int = 5, callback: Optional[callable] = None):
         """Start the Digit Differs trading bot"""
         try:
+            self.auth_token = token
+            self.connection_attempts = 0
+            
             # Connect to Deriv API
             auth_result = await deriv_api.connect(token)
             if "error" in auth_result:
                 return {"status": "error", "message": auth_result["error"]["message"]}
 
+            self.is_connected = True
             self.is_running = True
             self.active_symbol = symbol
             self.callback_function = callback
@@ -59,9 +129,9 @@ class DigitDiffersBot:
 
             # Subscribe to tick stream
             await deriv_api.subscribe_ticks(symbol, self._handle_tick)
-
+            
             # Start listening for API messages
-            asyncio.create_task(deriv_api.start_listening())
+            await deriv_api.start_listening()
 
             await self._log(f"Started Digit Differs bot on {symbol} with ${stake} stake", "success")
             return {"status": "started", "symbol": symbol, "strategy": self.strategy}
@@ -121,6 +191,24 @@ class DigitDiffersBot:
     async def _execute_differs_strategy(self, tick_data: Dict[str, Any], current_digit: int):
         """Execute DIGITDIFF strategy on rarest digits"""
         
+        # CHECK CONNECTION FIRST
+        if not await self.ensure_connection():
+            await self._log("Cannot execute trade: Not connected to Deriv API", "error")
+            
+            # Try to reconnect if within attempt limits
+            if self.connection_attempts < self.max_connection_attempts:
+                if not await self._reconnect():
+                    return
+            else:
+                await self._log("Max reconnection attempts reached. Stopping bot.", "error")
+                await self.stop()
+                return
+        
+        # Ensure we have an active symbol
+        if not self.active_symbol:
+            await self._log("No active symbol set", "error")
+            return
+        
         # Check cooldown
         current_time = time.time()
         if current_time - self.last_trade_time < self.trade_cooldown:
@@ -136,12 +224,18 @@ class DigitDiffersBot:
         if not rarest_digits:
             return
 
-        # Calculate dynamic stake based on balance
+        # Calculate dynamic stake based on balance with minimum requirement
         if self.current_balance > 0:
             max_allowed_stake = self.current_balance * self.max_stake_percentage
             adjusted_stake = min(self.stake, max_allowed_stake)
         else:
             adjusted_stake = self.stake
+        
+        # Ensure minimum stake requirement (Deriv minimum is $0.35)
+        MINIMUM_STAKE = 0.35
+        if adjusted_stake < MINIMUM_STAKE:
+            await self._log(f"Stake ${adjusted_stake:.2f} is below minimum ${MINIMUM_STAKE}. Using minimum stake.", "warning")
+            adjusted_stake = MINIMUM_STAKE
 
         # Trade logic: Use DIGITDIFF on the rarest digit
         target_digit = rarest_digits[0]  # Use the rarest digit
@@ -154,69 +248,172 @@ class DigitDiffersBot:
         # Trade if the digit appears less than 60% of expected frequency
         if actual_frequency < (expected_frequency * 0.6):
             
-            contract_data = {
-                "symbol": tick_data["symbol"],
-                "amount": adjusted_stake,
-                "contract_type": "DIGITDIFF",  # Differs contract
-                "barrier": str(target_digit),   # Predict next tick will NOT be this digit
-                "duration": self.duration,
-                "duration_unit": "t"  # tick-based contract
-            }
-
             try:
-                result = await deriv_api.buy_contract(contract_data)
+                # Prepare contract parameters
+                contract_params = {
+                    "contract_type": "DIGITDIFF",
+                    "symbol": self.active_symbol,
+                    "barrier": str(target_digit),
+                    "amount": round(adjusted_stake, 2),
+                    "basis": "stake",
+                    "duration": self.duration,
+                    "duration_unit": "t",
+                    "currency": "USD"
+                }
                 
-                if "error" not in result:
+                await self._log(f"Executing DIGITDIFF trade: {json.dumps(contract_params, indent=2)}", "debug")
+                
+                # Try different trading methods
+                result = await self._try_multiple_trade_methods(contract_params)
+                
+                # Check if trade was successful
+                if result and "error" not in result:
                     self.trades_placed += 1
                     self.last_trade_time = current_time
                     
                     await self._log(
-                        f"DIGITDIFF trade placed: Predict next tick ≠ {target_digit} "
+                        f"DIGITDIFF trade placed: Predict next tick != {target_digit} "
                         f"(appeared {actual_frequency}/{total_ticks} times, ${adjusted_stake} stake)",
-                        "info"
+                        "success"
                     )
                     
                     # Track the trade for outcome monitoring
                     asyncio.create_task(self._monitor_trade_outcome(result, target_digit))
                     
-                else:
+                elif result and "error" in result:
                     await self._log(f"Trade failed: {result['error']['message']}", "error")
-                    
+                else:
+                    await self._log("Trade failed: No response from API", "error")
+                        
             except Exception as e:
                 await self._log(f"Trade execution error: {str(e)}", "error")
 
-    async def _monitor_trade_outcome(self, trade_result: Dict[str, Any], predicted_digit: int):
-        """Monitor trade outcome and update statistics"""
+    async def _try_multiple_trade_methods(self, contract_params: dict):
+        """Try different methods to place a trade"""
+        result = None
+        
+        # Method 1: Direct buy_contract
         try:
-            # In a real implementation, you'd subscribe to the contract's updates
-            # For now, we'll simulate outcome tracking
+            await self._log("Trying direct buy_contract method...", "debug")
+            result = await deriv_api.buy_contract(contract_params)
             
-            contract_id = trade_result.get("buy", {}).get("contract_id")
+            if result and "error" not in result:
+                await self._log("Direct buy_contract succeeded", "debug")
+                return result
+            else:
+                await self._log(f"Direct buy_contract failed: {result.get('error', {}).get('message', 'Unknown error') if result else 'No response'}", "warning")
+                
+        except Exception as e:
+            await self._log(f"Direct buy_contract error: {str(e)}", "warning")
+        
+        # Method 2: Proposal + Buy
+        try:
+            await self._log("Trying proposal + buy method...", "debug")
+            
+            # Get proposal first
+            proposal_result = await deriv_api.get_proposal(contract_params)
+            
+            if proposal_result and "proposal" in proposal_result:
+                proposal_id = proposal_result["proposal"]["id"]
+                price = contract_params["amount"]
+                
+                await self._log(f"Got proposal {proposal_id}, now buying...", "debug")
+                
+                # Buy the proposal
+                result = await deriv_api.buy_proposal(proposal_id, price)
+                
+                if result and "error" not in result:
+                    await self._log("Proposal + buy succeeded", "debug")
+                    return result
+                else:
+                    await self._log(f"Proposal buy failed: {result.get('error', {}).get('message', 'Unknown error') if result else 'No response'}", "warning")
+            else:
+                await self._log(f"Proposal failed: {proposal_result.get('error', {}).get('message', 'Unknown error') if proposal_result else 'No response'}", "warning")
+                
+        except Exception as e:
+            await self._log(f"Proposal + buy error: {str(e)}", "warning")
+        
+        # Method 3: Raw send_request
+        try:
+            await self._log("Trying raw send_request method...", "debug")
+            
+            raw_request = {
+                "buy": 1,
+                "price": contract_params["amount"],
+                "parameters": contract_params
+            }
+            
+            result = await deriv_api.send_request(raw_request)
+            
+            if result and "error" not in result:
+                await self._log("Raw send_request succeeded", "debug")
+                return result
+            else:
+                await self._log(f"Raw send_request failed: {result.get('error', {}).get('message', 'Unknown error') if result else 'No response'}", "warning")
+                
+        except Exception as e:
+            await self._log(f"Raw send_request error: {str(e)}", "warning")
+        
+        return result
+
+    async def _monitor_trade_outcome(self, trade_result: Dict[str, Any], predicted_digit: int):
+        """Monitor REAL trade outcome using Deriv API"""
+        try:
+            contract_id = None
+            
+            # Try different ways to get contract ID from the response
+            if "buy" in trade_result:
+                if isinstance(trade_result["buy"], dict):
+                    contract_id = trade_result["buy"].get("contract_id")
+                elif isinstance(trade_result["buy"], str):
+                    contract_id = trade_result["buy"]
+            
             if not contract_id:
+                await self._log("No contract ID found in trade result", "warning")
                 return
             
-            # Wait for contract settlement (this is simplified)
-            await asyncio.sleep(2)  # Wait for next tick
+            await self._log(f"Monitoring contract {contract_id}", "info")
             
-            # Check if our prediction was correct
-            # In real implementation, query contract status from API
-            # For demo, we'll check if the next tick digit differs from our target
+            # Wait for contract to settle (5 ticks + buffer)
+            await asyncio.sleep(15)
             
-            if len(self.tick_history) > 0:
-                next_tick_digit = self.tick_history[-1]['digit']
-                won_trade = next_tick_digit != predicted_digit
+            # Check connection before monitoring
+            if not await self.ensure_connection():
+                await self._log("Cannot monitor trade: Connection lost", "error")
+                return
+            
+            try:
+                # Get contract status
+                contract_status = await deriv_api.get_contract_status(contract_id)
                 
-                if won_trade:
-                    self.successful_trades += 1
-                    profit = self.stake * 0.9  # Typical 90% payout
-                    self.total_pnl += profit
-                    self.daily_pnl += profit
-                    await self._log(f"Trade WON: Next tick was {next_tick_digit} ≠ {predicted_digit}. Profit: +${profit:.2f}", "success")
-                else:
-                    loss = -self.stake
-                    self.total_pnl += loss
-                    self.daily_pnl += loss
-                    await self._log(f"Trade LOST: Next tick was {next_tick_digit} = {predicted_digit}. Loss: ${abs(loss):.2f}", "error")
+                if contract_status and "proposal_open_contract" in contract_status:
+                    contract = contract_status["proposal_open_contract"]
+                    
+                    if contract.get("is_sold"):
+                        # Contract is finished
+                        profit_loss = float(contract.get("profit", 0))
+                        
+                        if profit_loss > 0:
+                            self.successful_trades += 1
+                            self.total_pnl += profit_loss
+                            self.daily_pnl += profit_loss
+                            await self._log(f"Trade WON: Contract {contract_id}. Profit: +${profit_loss:.2f}", "success")
+                        else:
+                            loss = abs(profit_loss)
+                            self.total_pnl += profit_loss  # Already negative
+                            self.daily_pnl += profit_loss
+                            await self._log(f"Trade LOST: Contract {contract_id}. Loss: -${loss:.2f}", "error")
+                        
+                        # Update balance
+                        balance_response = await deriv_api.get_balance()
+                        if "balance" in balance_response:
+                            self.current_balance = float(balance_response["balance"]["balance"])
+                            
+                    else:
+                        await self._log(f"Contract {contract_id} still active", "info")
+                        
+            except Exception as api_error:
+                await self._log(f"Could not get contract status: {str(api_error)}", "warning")
             
         except Exception as e:
             await self._log(f"Trade monitoring error: {str(e)}", "error")
@@ -227,6 +424,7 @@ class DigitDiffersBot:
         
         return {
             "is_running": self.is_running,
+            "is_connected": self.is_connected,
             "symbol": self.active_symbol,
             "total_trades": self.trades_placed,
             "successful_trades": self.successful_trades,
@@ -240,13 +438,24 @@ class DigitDiffersBot:
                 "digit_frequencies": dict(self.digit_frequencies),
                 "recent_ticks": [tick['digit'] for tick in list(self.tick_history)[-10:]]
             },
-            "uptime_minutes": round((time.time() - self.trade_start_time) / 60, 1)
+            "uptime_minutes": round((time.time() - self.trade_start_time) / 60, 1),
+            "connection_status": {
+                "connected": self.is_connected,
+                "connection_attempts": self.connection_attempts,
+                "max_attempts": self.max_connection_attempts
+            }
         }
 
     async def force_trade(self) -> Dict[str, Any]:
         """Execute immediate trade regardless of conditions"""
-        if not self.is_running or len(self.tick_history) == 0:
-            return {"status": "error", "message": "Bot not active or no tick data"}
+        if not self.is_running:
+            return {"status": "error", "message": "Bot not running"}
+        
+        if not await self.ensure_connection():
+            return {"status": "error", "message": "Not connected to Deriv API"}
+        
+        if len(self.tick_history) == 0:
+            return {"status": "error", "message": "No tick data available"}
         
         rarest_digits = self._get_rarest_digits(1)
         if not rarest_digits:
@@ -255,46 +464,63 @@ class DigitDiffersBot:
         target_digit = rarest_digits[0]
         last_tick = self.tick_history[-1]
         
-        # Force trade with current conditions
-        await self._execute_differs_strategy(
-            {"symbol": self.active_symbol, "quote": last_tick['quote']}, 
-            last_tick['digit']
-        )
+        # Force trade by temporarily setting last trade time to 0
+        original_trade_time = self.last_trade_time
+        self.last_trade_time = 0
         
-        return {
-            "status": "success", 
-            "message": f"Forced trade executed on digit {target_digit}",
-            "target_digit": target_digit
-        }
+        try:
+            await self._execute_differs_strategy(
+                {"symbol": self.active_symbol, "quote": last_tick['quote']}, 
+                last_tick['digit']
+            )
+            
+            return {
+                "status": "success", 
+                "message": f"Force trade executed on digit {target_digit}",
+                "target_digit": target_digit
+            }
+        finally:
+            # Restore original trade time if force trade failed
+            if self.last_trade_time == 0:
+                self.last_trade_time = original_trade_time
 
     async def update_settings(self, **kwargs):
         """Update bot settings dynamically"""
         if "stake" in kwargs:
-            self.stake = max(0.1, float(kwargs["stake"]))
+            new_stake = max(0.35, float(kwargs["stake"]))  # Ensure minimum stake
+            self.stake = new_stake
         if "trade_cooldown" in kwargs:
             self.trade_cooldown = max(1, int(kwargs["trade_cooldown"]))
         if "daily_loss_limit" in kwargs:
             self.daily_loss_limit = max(10, float(kwargs["daily_loss_limit"]))
+        if "duration" in kwargs:
+            self.duration = max(1, int(kwargs["duration"]))
         
         await self._log("Settings updated", "info")
 
     async def stop(self):
         """Stop the trading bot"""
         self.is_running = False
+        self.is_connected = False
         
         # Generate session summary
         stats = await self.get_statistics()
         await self._log(f"Session ended - Trades: {stats['total_trades']}, "
                        f"Win Rate: {stats['win_rate']}%, PnL: ${stats['total_pnl']}", "info")
         
-        await deriv_api.disconnect()
+        try:
+            await deriv_api.disconnect()
+        except:
+            pass
+            
         return {"status": "stopped", "session_stats": stats}
 
     async def _log(self, message: str, level: str = "info"):
         """Internal logging method"""
-        print(f"[{time.strftime('%H:%M:%S')}] [{level.upper()}] {message}")
+        timestamp = time.strftime('%H:%M:%S')
+        print(f"[{timestamp}] [{level.upper()}] {message}")
         
-        # You can extend this to send logs to the frontend
+        # Send logs to frontend
         if self.callback_function:
             try:
                 await self.callback_function({
@@ -304,7 +530,7 @@ class DigitDiffersBot:
                     "timestamp": time.time()
                 })
             except:
-                pass  # Don't fail on logging errors
+                pass
 
 
 # Global trading bot instance
